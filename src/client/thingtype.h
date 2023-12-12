@@ -279,6 +279,7 @@ public:
 #endif
 
     void draw(const Point& dest, int layer, int xPattern, int yPattern, int zPattern, int animationPhase, const Color& color, bool drawThings = true, LightView* lightView = nullptr, const DrawConductor& conductor = DEFAULT_DRAW_CONDUCTOR);
+    void drawWithFrameBuffer(const TexturePtr& texture, const Rect& screenRect, const Rect& textureRect, const Color& color, const DrawConductor& conductor);
 
     uint16_t getId() { return m_id; }
     ThingCategory getCategory() { return m_category; }
@@ -313,8 +314,8 @@ public:
     int getLensHelp() { return m_lensHelp; }
     int getClothSlot() { return m_clothSlot; }
 
-    bool isTopGround() { return isGround() && !isSingleDimension(); }
-    bool isTopGroundBorder() { return isGroundBorder() && !isSingleDimension(); }
+    bool isTopGround() { return isGround() && m_size.dimension() == 4; }
+    bool isTopGroundBorder() { return isGroundBorder() && m_size.dimension() == 4; }
     bool isSingleGround() { return isGround() && isSingleDimension(); }
     bool isSingleGroundBorder() { return isGroundBorder() && isSingleDimension(); }
     bool isTall(const bool useRealSize = false);

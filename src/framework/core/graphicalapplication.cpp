@@ -21,10 +21,7 @@
  */
 
 #include "graphicalapplication.h"
-#include <thread>
-#include <client/game.h>
-#include <client/map.h>
-#include <client/uimap.h>
+
 #include <framework/core/asyncdispatcher.h>
 #include <framework/core/clock.h>
 #include <framework/core/eventdispatcher.h>
@@ -43,11 +40,16 @@
 #include <framework/sound/soundmanager.h>
 #endif
 
+#include <thread>
+
 GraphicalApplication g_app;
 
-void GraphicalApplication::init(std::vector<std::string>& args, uint8_t asyncDispatchMaxThreads)
+void GraphicalApplication::init(std::vector<std::string>& args, ApplicationContext* context)
 {
-    Application::init(args, asyncDispatchMaxThreads);
+    Application::init(args, context);
+
+    GraphicalApplicationContext* graphicalContext = static_cast<GraphicalApplicationContext*>(context);
+    setDrawEvents(graphicalContext->getDrawEvents());
 
     // setup platform window
     g_window.init();
@@ -72,7 +74,7 @@ void GraphicalApplication::init(std::vector<std::string>& args, uint8_t asyncDis
 
     // initialize graphics
     g_graphics.init();
-    g_drawPool.init(g_gameConfig.getSpriteSize());
+    g_drawPool.init(graphicalContext->getSpriteSize());
 
     // fire first resize event
     resize(g_window.getSize());
@@ -82,7 +84,8 @@ void GraphicalApplication::init(std::vector<std::string>& args, uint8_t asyncDis
     g_sounds.init();
 #endif
 
-    m_frameCounter.init();
+    m_mapProcessFrameCounter.init();
+    m_graphicFrameCounter.init();
 }
 
 void GraphicalApplication::deinit()
@@ -134,14 +137,53 @@ void GraphicalApplication::run()
 
     g_lua.callGlobalField("g_app", "onRun");
 
-    const auto& foreground = g_drawPool.get(DrawPoolType::FOREGROUND);
-    const auto& txt = g_drawPool.get(DrawPoolType::TEXT);
-    const auto& map = g_drawPool.get(DrawPoolType::MAP);
+    std::condition_variable foregroundUICondition, foregroundMapCondition;
+    std::atomic_bool mapThreadStopping = false;
 
-    std::condition_variable foreCondition, txtCondition;
+    const auto& FPS = [&] {
+        m_mapProcessFrameCounter.setTargetFps(g_window.vsyncEnabled() || getMaxFps() || getTargetFps() ? 500u : 999u);
+        return m_graphicFrameCounter.getFps();
+    };
 
-    // clang c++20 dont support jthread
-    std::thread t1([&]() {
+    const auto& drawForeground = [&] {
+        const auto& foregroundUI = g_drawPool.get(DrawPoolType::FOREGROUND);
+        const auto& foregroundMap = g_drawPool.get(DrawPoolType::FOREGROUND_MAP);
+
+        if (foregroundUI->canRepaint()) {
+            if (m_drawEvents && m_drawEvents->canDrawUI())
+                foregroundUICondition.notify_one();
+            else
+                g_ui.render(DrawPoolType::FOREGROUND);
+        }
+
+        if (m_drawEvents && m_drawEvents->canDraw(DrawPoolType::FOREGROUND_MAP) && foregroundMap->canRepaint())
+            foregroundMapCondition.notify_one();
+    };
+
+    // THREAD - FOREGROUND UI
+    g_asyncDispatcher.dispatch([this, &condition = foregroundUICondition] {
+        const auto& pool = g_drawPool.get(DrawPoolType::FOREGROUND);
+        std::unique_lock lock(pool->getMutexPreDraw());
+        condition.wait(lock, [this]() -> bool {
+            g_ui.render(DrawPoolType::FOREGROUND);
+            return m_stopping;
+        });
+    });
+
+    // THREAD - FOREGROUND MAP
+    g_asyncDispatcher.dispatch([this, &condition = foregroundMapCondition] {
+        const auto& pool = g_drawPool.get(DrawPoolType::FOREGROUND_MAP);
+        std::unique_lock lock(pool->getMutexPreDraw());
+        condition.wait(lock, [this]() -> bool {
+            if (m_drawEvents)
+                m_drawEvents->drawForgroundMap();
+            return m_stopping;
+        });
+    });
+
+    // THREAD - POOL & MAP
+    g_asyncDispatcher.dispatch([&] {
+        g_eventThreadId = EventDispatcher::getThreadId();
         while (!m_stopping) {
             poll();
 
@@ -150,53 +192,18 @@ void GraphicalApplication::run()
                 continue;
             }
 
-            /*if (g_drawPool.isDrawing()) {
-                stdext::millisleep(1);
-                continue;
-            }*/
+            drawForeground();
 
-            if (foreground->canRepaint())
-                foreCondition.notify_one();
+            if (m_drawEvents)
+                m_drawEvents->drawMap();
 
-            if (g_game.isOnline()) {
-                if (!g_ui.m_mapWidget)
-                    g_ui.m_mapWidget = g_ui.getRootWidget()->recursiveGetChildById("gameMapPanel")->static_self_cast<UIMap>();
-
-                if (txt->canRepaint())
-                    txtCondition.notify_one();
-
-                {
-                    std::scoped_lock l(map->getMutex());
-                    g_ui.m_mapWidget->drawSelf(DrawPoolType::MAP);
-                }
-            } else g_ui.m_mapWidget = nullptr;
-
-            stdext::millisleep(1);
+            m_mapProcessFrameCounter.update();
         }
 
-        foreCondition.notify_one();
-        txtCondition.notify_one();
-    });
-
-    std::thread t2([&]() {
-        std::unique_lock lock(foreground->getMutex());
-        foreCondition.wait(lock, [&]() -> bool {
-            g_ui.render(DrawPoolType::FOREGROUND);
-            return m_stopping;
-        });
-    });
-
-    std::thread t3([&]() {
-        std::unique_lock lock(txt->getMutex());
-        txtCondition.wait(lock, [&]() -> bool {
-            g_textDispatcher.poll();
-
-            txt->setEnable(canDrawTexts());
-            if (g_ui.m_mapWidget && txt->isEnabled())
-                g_ui.m_mapWidget->drawSelf(DrawPoolType::TEXT);
-
-            return m_stopping;
-        });
+        foregroundUICondition.notify_one();
+        foregroundMapCondition.notify_one();
+        mapThreadStopping.store(true);
+        mapThreadStopping.notify_one();
     });
 
     m_running = true;
@@ -212,15 +219,17 @@ void GraphicalApplication::run()
 
         // update screen pixels
         g_window.swapBuffers();
-        m_frameCounter.update();
+
+        if (m_graphicFrameCounter.update()) {
+            g_dispatcher.addEvent([this, fps = FPS()] {
+                g_lua.callGlobalField("g_app", "onFps", fps);
+            });
+        }
     }
 
-    t1.join();
-    t2.join();
-    t3.join();
-
-    m_stopping = false;
+    mapThreadStopping.wait(false);
     m_running = false;
+    m_stopping = false;
 }
 
 void GraphicalApplication::poll()
@@ -236,6 +245,12 @@ void GraphicalApplication::poll()
     if (!g_window.isVisible()) {
         g_textDispatcher.poll();
     }
+}
+
+void GraphicalApplication::dispatchPoll()
+{
+    std::scoped_lock l(g_drawPool.get(DrawPoolType::FOREGROUND)->getMutexPreDraw());
+    Application::dispatchPoll();
 }
 
 void GraphicalApplication::mainPoll()
@@ -268,7 +283,8 @@ void GraphicalApplication::resize(const Size& size)
 
         if (USE_FRAMEBUFFER) {
             g_drawPool.get(DrawPoolType::CREATURE_INFORMATION)->setFramebuffer(size);
-            g_drawPool.get(DrawPoolType::TEXT)->setFramebuffer(size);
+            g_drawPool.get(DrawPoolType::FOREGROUND_MAP)->setFramebuffer(size);
+            g_drawPool.get(DrawPoolType::FOREGROUND_MAP_WIDGETS)->setFramebuffer(size);
         }
     });
 }
@@ -282,16 +298,17 @@ void GraphicalApplication::inputEvent(const InputEvent& event)
 
 void GraphicalApplication::repaintMap() { g_drawPool.get(DrawPoolType::MAP)->repaint(); }
 void GraphicalApplication::repaint() { g_drawPool.get(DrawPoolType::FOREGROUND)->repaint(); }
-bool GraphicalApplication::canDrawTexts() const { return m_drawText && (!g_map.getStaticTexts().empty() || !g_map.getAnimatedTexts().empty()); }
-
-bool GraphicalApplication::isLoadingAsyncTexture() { return m_loadingAsyncTexture || g_game.isUsingProtobuf(); }
+bool GraphicalApplication::canDrawTexts() const { return m_drawText && (!m_drawEvents || m_drawEvents->canDrawTexts()); }
+bool GraphicalApplication::isLoadingAsyncTexture() { return m_loadingAsyncTexture || (m_drawEvents && m_drawEvents->isLoadingAsyncTexture()); }
 
 void GraphicalApplication::setLoadingAsyncTexture(bool v) {
-    if (g_game.isUsingProtobuf())
+    if (m_drawEvents && m_drawEvents->isUsingProtobuf())
         v = true;
     else if (isEncrypted())
         v = false;
 
     m_loadingAsyncTexture = v;
-    g_sprites.reload();
+
+    if (m_drawEvents)
+        m_drawEvents->onLoadingAsyncTextureChanged(v);
 }
