@@ -30,7 +30,7 @@ function HTTP.post(url, data, callback, checkContentLength)
   if not g_http or not g_http.post then
     return error("HTTP.post is not supported")
   end
-  local is_json = true
+  local is_json = false
   if type(data) == "table" then
     data = json.encode(data)
     is_json = true
